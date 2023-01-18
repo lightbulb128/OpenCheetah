@@ -3,6 +3,9 @@ cmake_minimum_required (VERSION 3.10)
 project (SCI)
 set(NAME "SCI")
 
+
+add_compile_options("-fPIC")
+
 option(SCI_BUILD_TESTS "Build tests" OFF)
 message(STATUS "Option: SCI_BUILD_TESTS = ${SCI_BUILD_TESTS}")
 

@@ -26,6 +26,8 @@ template <typename IO, typename intType> class ReLUProtocol {
 public:
   virtual void relu(intType *outp, intType *inp, int numRelu,
                     uint8_t *drelu_res = nullptr, bool skip_ot = false) = 0;
+  virtual void drelumul(intType *result, intType *share, int num_relu,
+            uint8_t *drelu_res, bool skip_ot = false) = 0;
 };
 
 #endif // RELU_INTERFACE_H__

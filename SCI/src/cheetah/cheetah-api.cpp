@@ -73,8 +73,8 @@ uint64_t CheetahLinear::reduce(uint64_t x) const {
 CheetahLinear::CheetahLinear(int party, sci::NetIO *io, uint64_t base_mod,
                              size_t nthreads)
     : party_(party), io_(io), nthreads_(nthreads), base_mod_(base_mod) {
-  if (base_mod < 2ULL || (int)std::log2(base_mod) >= 45) {
-    throw std::logic_error("CheetahLinear: base_mod out-of-bound [2, 2^45)");
+  if (base_mod < 2ULL || (int)std::log2(base_mod) >= 61) {
+    throw std::logic_error("CheetahLinear: base_mod out-of-bound [2, 2^61)");
   }
 
   const bool is_mod_2k = IsTwoPower(base_mod_);

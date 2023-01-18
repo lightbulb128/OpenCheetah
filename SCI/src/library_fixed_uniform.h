@@ -77,6 +77,12 @@ void ArgMax(int32_t s1, int32_t s2, intType *inArr, intType *outArr);
 void Relu(int32_t size, intType *inArr, intType *outArr, int sf,
           bool doTruncation);
 
+
+void ReluWithDRelu(int32_t size, intType *inArr, intType *outArr, uint8_t* outDReluArr, int sf,
+          bool doTruncation);
+
+void DReluMul(int32_t size, intType* inArr, uint8_t* inDReluArr, intType* outArr, int sf, bool doTruncation);
+
 void MaxPool(int32_t N, int32_t H, int32_t W, int32_t C, int32_t ksizeH,
              int32_t ksizeW, int32_t zPadHLeft, int32_t zPadHRight,
              int32_t zPadWLeft, int32_t zPadWRight, int32_t strideH,
@@ -90,12 +96,13 @@ void AvgPool(int32_t N, int32_t H, int32_t W, int32_t C, int32_t ksizeH,
              int32_t C1, intType *inArr, intType *outArr);
 
 void ScaleDown(int32_t size, intType *inArr, int32_t sf);
+void Divide(int32_t size, intType *inArr, uint64_t divisor);
 
 void ScaleUp(int32_t size, intType *arr, int32_t sf);
 
 void StartComputation();
 
-void EndComputation();
+void EndComputation(bool printInfo=true);
 
 intType SecretAdd(intType x, intType y);
 

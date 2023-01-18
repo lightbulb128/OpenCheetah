@@ -1,5 +1,8 @@
 // Author: Wen-jie Lu
 // Adapter for the SCI's implementation using Cheetah's linear protocols.
+
+#define USE_CHEETAH 1
+
 #if USE_CHEETAH
 
 #include <gemini/cheetah/tensor.h>

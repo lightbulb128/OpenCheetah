@@ -196,6 +196,11 @@ void funcReLUThread(int tid, intType *outp, intType *inp, int numRelu,
   reluArr[tid]->relu(outp, inp, numRelu, drelu_res, skip_ot);
 }
 
+void funcDReLUMulThread(int tid, intType *outp, intType *inp, int numRelu,
+                    uint8_t *drelu_res, bool skip_ot = false) {
+  reluArr[tid]->drelumul(outp, inp, numRelu, drelu_res, skip_ot);
+}
+
 void funcMaxpoolThread(int tid, int rows, int cols, intType *inpArr, intType *maxi, intType *maxiIdx) {
   maxpoolArr[tid]->funcMaxMPC(rows, cols, inpArr, maxi, maxiIdx);
 }

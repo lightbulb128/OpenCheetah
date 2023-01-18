@@ -48,3 +48,9 @@ endmacro()
 add_network_cheetah(resnet50)
 add_network_cheetah(sqnet)
 add_network_cheetah(densenet121)
+
+add_network_cheetah(matmul)
+
+
+add_subdirectory(SCI/extern/pybind11)
+add_subdirectory(SCI/pybind-test)

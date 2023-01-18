@@ -746,6 +746,340 @@ void ArgMax(int32_t s1, int32_t s2, intType *inArr, intType *outArr) {
 #endif
 }
 
+
+
+void ReluWithDRelu(int32_t size, intType *inArr, intType *outArr, uint8_t* outDReluArr, int sf, bool doTruncation) {
+#ifdef LOG_LAYERWISE
+  INIT_ALL_IO_DATA_SENT;
+  INIT_TIMER;
+#endif
+
+  static int ctr = 1;
+  // printf("Relu #%d on %d points, truncate=%d by %d bits\n", ctr++, size, doTruncation, sf);
+  ctr++;
+
+  intType moduloMask = sci::all1Mask(bitlength);
+  int eightDivElemts = ((size + 8 - 1) / 8) * 8;  //(ceil of s1*s2/8.0)*8
+  uint8_t *msbShare = new uint8_t[eightDivElemts];
+  intType *tempInp = new intType[eightDivElemts];
+  intType *tempOutp = new intType[eightDivElemts];
+  sci::copyElemWisePadded(size, inArr, eightDivElemts, tempInp, 0);
+
+#ifndef MULTITHREADED_NONLIN
+  relu->relu(tempOutp, tempInp, eightDivElemts, nullptr);
+#else
+  std::thread relu_threads[num_threads];
+  int chunk_size = (eightDivElemts / (8 * num_threads)) * 8;
+  for (int i = 0; i < num_threads; ++i) {
+    int offset = i * chunk_size;
+    int lnum_relu;
+    if (i == (num_threads - 1)) {
+      lnum_relu = eightDivElemts - offset;
+    } else {
+      lnum_relu = chunk_size;
+    }
+    relu_threads[i] = std::thread(funcReLUThread, i, tempOutp + offset, tempInp + offset, lnum_relu, outDReluArr + offset, false);
+  }
+  for (int i = 0; i < num_threads; ++i) {
+    relu_threads[i].join();
+  }
+#endif
+
+#ifdef LOG_LAYERWISE
+  auto temp = TIMER_TILL_NOW;
+  ReluTimeInMilliSec += temp;
+  // std::cout << "Time in sec for current relu = " << (temp / 1000.0) << std::endl;
+  uint64_t curComm;
+  FIND_ALL_IO_TILL_NOW(curComm);
+  ReluCommSent += curComm;
+#endif
+
+  if (doTruncation) {
+#ifdef LOG_LAYERWISE
+    INIT_ALL_IO_DATA_SENT;
+    INIT_TIMER;
+#endif
+    for (int i = 0; i < eightDivElemts; i++) {
+      msbShare[i] = 0;  // After relu, all numbers are +ve
+    }
+
+    intType *tempTruncOutp = new intType[eightDivElemts];
+#ifdef SCI_OT
+    for (int i = 0; i < eightDivElemts; i++) {
+      tempOutp[i] = tempOutp[i] & moduloMask;
+    }
+
+#if USE_CHEETAH == 0
+    funcTruncateTwoPowerRingWrapper(eightDivElemts, tempOutp, tempTruncOutp, sf, bitlength, true, msbShare);
+#else
+    funcReLUTruncateTwoPowerRingWrapper(eightDivElemts, tempOutp, tempTruncOutp, sf, bitlength, true);
+#endif
+
+#else
+    funcFieldDivWrapper<intType>(eightDivElemts, tempOutp, tempTruncOutp, 1ULL << sf, msbShare);
+#endif
+    memcpy(outArr, tempTruncOutp, size * sizeof(intType));
+    delete[] tempTruncOutp;
+
+#ifdef LOG_LAYERWISE
+    auto temp = TIMER_TILL_NOW;
+    TruncationTimeInMilliSec += temp;
+    uint64_t curComm;
+    FIND_ALL_IO_TILL_NOW(curComm);
+    TruncationCommSent += curComm;
+#endif
+  } else {
+    for (int i = 0; i < size; i++) {
+      outArr[i] = tempOutp[i];
+    }
+  }
+
+#ifdef SCI_OT
+  for (int i = 0; i < size; i++) {
+    outArr[i] = outArr[i] & moduloMask;
+  }
+#endif
+
+#ifdef VERIFY_LAYERWISE
+#ifdef SCI_HE
+  for (int i = 0; i < size; i++) {
+    assert(tempOutp[i] < prime_mod);
+    assert(outArr[i] < prime_mod);
+  }
+#endif
+
+  if (party == SERVER) {
+    funcReconstruct2PCCons(nullptr, inArr, size);
+    funcReconstruct2PCCons(nullptr, tempOutp, size);
+    funcReconstruct2PCCons(nullptr, outArr, size);
+  } else {
+    signedIntType *VinArr = new signedIntType[size];
+    funcReconstruct2PCCons(VinArr, inArr, size);
+    signedIntType *VtempOutpArr = new signedIntType[size];
+    funcReconstruct2PCCons(VtempOutpArr, tempOutp, size);
+    signedIntType *VoutArr = new signedIntType[size];
+    funcReconstruct2PCCons(VoutArr, outArr, size);
+
+    std::vector<uint64_t> VinVec;
+    VinVec.resize(size, 0);
+
+    std::vector<uint64_t> VoutVec;
+    VoutVec.resize(size, 0);
+
+    for (int i = 0; i < size; i++) {
+      VinVec[i] = getRingElt(VinArr[i]);
+    }
+
+    Relu_pt(size, VinVec, VoutVec, 0, false);  // sf = 0
+
+    bool pass = true;
+    for (int i = 0; i < size; i++) {
+      if (VtempOutpArr[i] != getSignedVal(VoutVec[i])) {
+        pass = false;
+      }
+    }
+    if (pass == true)
+      std::cout << GREEN << "ReLU Output Matches" << RESET << std::endl;
+    else
+      std::cout << RED << "ReLU Output Mismatch" << RESET << std::endl;
+
+    ScaleDown_pt(size, VoutVec, sf);
+
+    pass = true;
+#if USE_CHEETAH
+    constexpr signedIntType error_upper = 1;
+#else
+    constexpr signedIntType error_upper = 0;
+#endif
+    for (int i = 0; i < size; i++) {
+      if (std::abs(VoutArr[i] - getSignedVal(VoutVec[i])) > error_upper) {
+        pass = false;
+      }
+    }
+    if (pass == true)
+      std::cout << GREEN << "Truncation (after ReLU) Output Matches" << RESET
+                << std::endl;
+    else
+      std::cout << RED << "Truncation (after ReLU) Output Mismatch" << RESET
+                << std::endl;
+
+    delete[] VinArr;
+    delete[] VtempOutpArr;
+    delete[] VoutArr;
+  }
+#endif
+
+  delete[] tempInp;
+  delete[] tempOutp;
+  delete[] msbShare;
+}
+
+void DReluMul(int32_t size, intType* inArr, uint8_t* inDReluArr, intType* outArr, int sf, bool doTruncation) {
+#ifdef LOG_LAYERWISE
+  INIT_ALL_IO_DATA_SENT;
+  INIT_TIMER;
+#endif
+
+  static int ctr = 1;
+  // printf("Relu #%d on %d points, truncate=%d by %d bits\n", ctr++, size, doTruncation, sf);
+  ctr++;
+
+  intType moduloMask = sci::all1Mask(bitlength);
+  int eightDivElemts = ((size + 8 - 1) / 8) * 8;  //(ceil of s1*s2/8.0)*8
+  uint8_t *msbShare = new uint8_t[eightDivElemts];
+  intType *tempInp = new intType[eightDivElemts];
+  intType *tempOutp = new intType[eightDivElemts];
+  sci::copyElemWisePadded(size, inArr, eightDivElemts, tempInp, 0);
+
+#ifndef MULTITHREADED_NONLIN
+  relu->relu(tempOutp, tempInp, eightDivElemts, nullptr);
+#else
+  std::thread relu_threads[num_threads];
+  int chunk_size = (eightDivElemts / (8 * num_threads)) * 8;
+  for (int i = 0; i < num_threads; ++i) {
+    int offset = i * chunk_size;
+    int lnum_relu;
+    if (i == (num_threads - 1)) {
+      lnum_relu = eightDivElemts - offset;
+    } else {
+      lnum_relu = chunk_size;
+    }
+    relu_threads[i] = std::thread(funcDReLUMulThread, i, tempOutp + offset, tempInp + offset, lnum_relu, inDReluArr + offset, false);
+  }
+  for (int i = 0; i < num_threads; ++i) {
+    relu_threads[i].join();
+  }
+#endif
+
+#ifdef LOG_LAYERWISE
+  auto temp = TIMER_TILL_NOW;
+  ReluTimeInMilliSec += temp;
+  // std::cout << "Time in sec for current relu = " << (temp / 1000.0) << std::endl;
+  uint64_t curComm;
+  FIND_ALL_IO_TILL_NOW(curComm);
+  ReluCommSent += curComm;
+#endif
+
+  if (doTruncation) {
+#ifdef LOG_LAYERWISE
+    INIT_ALL_IO_DATA_SENT;
+    INIT_TIMER;
+#endif
+    for (int i = 0; i < eightDivElemts; i++) {
+      msbShare[i] = 0;  // After relu, all numbers are +ve
+    }
+
+    intType *tempTruncOutp = new intType[eightDivElemts];
+#ifdef SCI_OT
+    for (int i = 0; i < eightDivElemts; i++) {
+      tempOutp[i] = tempOutp[i] & moduloMask;
+    }
+
+#if USE_CHEETAH == 0
+    funcTruncateTwoPowerRingWrapper(eightDivElemts, tempOutp, tempTruncOutp, sf, bitlength, true, msbShare);
+#else
+    funcReLUTruncateTwoPowerRingWrapper(eightDivElemts, tempOutp, tempTruncOutp, sf, bitlength, true);
+#endif
+
+#else
+    funcFieldDivWrapper<intType>(eightDivElemts, tempOutp, tempTruncOutp, 1ULL << sf, msbShare);
+#endif
+    memcpy(outArr, tempTruncOutp, size * sizeof(intType));
+    delete[] tempTruncOutp;
+
+#ifdef LOG_LAYERWISE
+    auto temp = TIMER_TILL_NOW;
+    TruncationTimeInMilliSec += temp;
+    uint64_t curComm;
+    FIND_ALL_IO_TILL_NOW(curComm);
+    TruncationCommSent += curComm;
+#endif
+  } else {
+    for (int i = 0; i < size; i++) {
+      outArr[i] = tempOutp[i];
+    }
+  }
+
+#ifdef SCI_OT
+  for (int i = 0; i < size; i++) {
+    outArr[i] = outArr[i] & moduloMask;
+  }
+#endif
+
+#ifdef VERIFY_LAYERWISE
+#ifdef SCI_HE
+  for (int i = 0; i < size; i++) {
+    assert(tempOutp[i] < prime_mod);
+    assert(outArr[i] < prime_mod);
+  }
+#endif
+
+  if (party == SERVER) {
+    funcReconstruct2PCCons(nullptr, inArr, size);
+    funcReconstruct2PCCons(nullptr, tempOutp, size);
+    funcReconstruct2PCCons(nullptr, outArr, size);
+  } else {
+    signedIntType *VinArr = new signedIntType[size];
+    funcReconstruct2PCCons(VinArr, inArr, size);
+    signedIntType *VtempOutpArr = new signedIntType[size];
+    funcReconstruct2PCCons(VtempOutpArr, tempOutp, size);
+    signedIntType *VoutArr = new signedIntType[size];
+    funcReconstruct2PCCons(VoutArr, outArr, size);
+
+    std::vector<uint64_t> VinVec;
+    VinVec.resize(size, 0);
+
+    std::vector<uint64_t> VoutVec;
+    VoutVec.resize(size, 0);
+
+    for (int i = 0; i < size; i++) {
+      VinVec[i] = getRingElt(VinArr[i]);
+    }
+
+    Relu_pt(size, VinVec, VoutVec, 0, false);  // sf = 0
+
+    bool pass = true;
+    for (int i = 0; i < size; i++) {
+      if (VtempOutpArr[i] != getSignedVal(VoutVec[i])) {
+        pass = false;
+      }
+    }
+    if (pass == true)
+      std::cout << GREEN << "ReLU Output Matches" << RESET << std::endl;
+    else
+      std::cout << RED << "ReLU Output Mismatch" << RESET << std::endl;
+
+    ScaleDown_pt(size, VoutVec, sf);
+
+    pass = true;
+#if USE_CHEETAH
+    constexpr signedIntType error_upper = 1;
+#else
+    constexpr signedIntType error_upper = 0;
+#endif
+    for (int i = 0; i < size; i++) {
+      if (std::abs(VoutArr[i] - getSignedVal(VoutVec[i])) > error_upper) {
+        pass = false;
+      }
+    }
+    if (pass == true)
+      std::cout << GREEN << "Truncation (after ReLU) Output Matches" << RESET
+                << std::endl;
+    else
+      std::cout << RED << "Truncation (after ReLU) Output Mismatch" << RESET
+                << std::endl;
+
+    delete[] VinArr;
+    delete[] VtempOutpArr;
+    delete[] VoutArr;
+  }
+#endif
+
+  delete[] tempInp;
+  delete[] tempOutp;
+  delete[] msbShare;
+}
+
 void Relu(int32_t size, intType *inArr, intType *outArr, int sf, bool doTruncation) {
 #ifdef LOG_LAYERWISE
   INIT_ALL_IO_DATA_SENT;
@@ -1282,13 +1616,109 @@ void AvgPool(int32_t N, int32_t H, int32_t W, int32_t C, int32_t ksizeH,
 #endif
 }
 
+void Divide(int32_t size, intType *inArr, intType divisor) {
+#ifdef LOG_LAYERWISE
+  INIT_ALL_IO_DATA_SENT;
+  INIT_TIMER;
+#endif
+  static int ctr = 1;
+  // printf("Truncate #%d on %d points by %d bits\n", ctr++, size, sf);
+
+  int eightDivElemts = ((size + 8 - 1) / 8) * 8; //(ceil of s1*s2/8.0)*8
+  intType *tempInp;
+  if (size != eightDivElemts) {
+    tempInp = new intType[eightDivElemts];
+    memcpy(tempInp, inArr, sizeof(intType) * size);
+  } else {
+    tempInp = inArr;
+  }
+  intType *outp = new intType[eightDivElemts];
+
+#ifdef SCI_OT
+  uint64_t moduloMask = sci::all1Mask(bitlength);
+  for (int i = 0; i < eightDivElemts; i++) {
+    tempInp[i] = tempInp[i] & moduloMask;
+  }
+
+  
+  funcAvgPoolTwoPowerRingWrapper(eightDivElemts, tempInp, outp,
+                                 divisor);
+
+  // funcTruncateTwoPowerRingWrapper(eightDivElemts, tempInp, outp, sf, bitlength, true, nullptr);
+#else
+  for (int i = 0; i < eightDivElemts; i++) {
+    tempInp[i] = sci::neg_mod(tempInp[i], (int64_t)prime_mod);
+  }
+  funcFieldDivWrapper<intType>(eightDivElemts, tempInp, outp, divisor, nullptr);
+#endif
+
+#ifdef LOG_LAYERWISE
+  auto temp = TIMER_TILL_NOW;
+  TruncationTimeInMilliSec += temp;
+  uint64_t curComm;
+  FIND_ALL_IO_TILL_NOW(curComm);
+  TruncationCommSent += curComm;
+#endif
+
+#ifdef VERIFY_LAYERWISE
+#ifdef SCI_HE
+  for (int i = 0; i < size; i++) {
+    assert(outp[i] < prime_mod);
+  }
+#endif
+
+  if (party == SERVER) {
+    funcReconstruct2PCCons(nullptr, inArr, size);
+    funcReconstruct2PCCons(nullptr, outp, size);
+  } else {
+    signedIntType *VinArr = new signedIntType[size];
+    funcReconstruct2PCCons(VinArr, inArr, size);
+    signedIntType *VoutpArr = new signedIntType[size];
+    funcReconstruct2PCCons(VoutpArr, outp, size);
+
+    std::vector<uint64_t> VinVec;
+    VinVec.resize(size, 0);
+
+    for (int i = 0; i < size; i++) {
+      VinVec[i] = getRingElt(VinArr[i]);
+    }
+
+    ScaleDown_pt(size, VinVec, sf);
+
+    bool pass = true;
+#if USE_CHEETAH
+    constexpr signedIntType error_upper = 1;
+#else
+    constexpr signedIntType error_upper = 0;
+#endif
+    for (int i = 0; i < size; i++) {
+      if (std::abs(VoutpArr[i] - getSignedVal(VinVec[i])) > error_upper) {
+        pass = false;
+      }
+    }
+
+    if (pass == true)
+      std::cout << GREEN << "Truncation4 Output Matches" << RESET << std::endl;
+    else
+      std::cout << RED << "Truncation4 Output Mismatch" << RESET << std::endl;
+
+    delete[] VinArr;
+    delete[] VoutpArr;
+  }
+#endif
+
+  std::memcpy(inArr, outp, sizeof(intType) * size);
+  delete[] outp;
+  if (size != eightDivElemts) delete[] tempInp;
+}
+
 void ScaleDown(int32_t size, intType *inArr, int32_t sf) {
 #ifdef LOG_LAYERWISE
   INIT_ALL_IO_DATA_SENT;
   INIT_TIMER;
 #endif
   static int ctr = 1;
-  printf("Truncate #%d on %d points by %d bits\n", ctr++, size, sf);
+  // printf("Truncate #%d on %d points by %d bits\n", ctr++, size, sf);
 
   int eightDivElemts = ((size + 8 - 1) / 8) * 8; //(ceil of s1*s2/8.0)*8
   intType *tempInp;
@@ -1562,7 +1992,7 @@ void StartComputation() {
             << std::endl;
 }
 
-void EndComputation() {
+void EndComputation(bool printInfo) {
   auto endTimer = std::chrono::high_resolution_clock::now();
   auto execTimeInMilliSec =
       std::chrono::duration_cast<std::chrono::milliseconds>(endTimer -
@@ -1576,14 +2006,14 @@ void EndComputation() {
     totalComm += (temp - comm_threads[i]);
   }
   uint64_t totalCommClient;
-  std::cout << "------------------------------------------------------\n";
-  std::cout << "------------------------------------------------------\n";
-  std::cout << "------------------------------------------------------\n";
-  std::cout << "Total time taken = " << execTimeInMilliSec
+  if (printInfo) std::cout << "------------------------------------------------------\n";
+  if (printInfo) std::cout << "------------------------------------------------------\n";
+  if (printInfo) std::cout << "------------------------------------------------------\n";
+  if (printInfo) std::cout << "Total time taken = " << execTimeInMilliSec
             << " milliseconds.\n";
-  std::cout << "Total data sent = " << (totalComm / (1.0 * (1ULL << 20)))
+  if (printInfo) std::cout << "Total data sent = " << (totalComm / (1.0 * (1ULL << 20)))
             << " MiB." << std::endl;
-  std::cout << "Number of rounds = " << ioArr[0]->num_rounds - num_rounds
+  if (printInfo) std::cout << "Number of rounds = " << ioArr[0]->num_rounds - num_rounds
             << std::endl;
   if (party == SERVER) {
     io->recv_data(&totalCommClient, sizeof(uint64_t));
@@ -1595,85 +2025,85 @@ void EndComputation() {
     std::cout << "Total comm (sent+received) = (see SERVER OUTPUT)"
               << std::endl;
   }
-  std::cout << "------------------------------------------------------\n";
+  if (printInfo) std::cout << "------------------------------------------------------\n";
 
 #ifdef LOG_LAYERWISE
-  std::cout << "Total time in Conv = " << (ConvTimeInMilliSec / 1000.0)
+  if (printInfo) std::cout << "Total time in Conv = " << (ConvTimeInMilliSec / 1000.0)
             << " seconds." << std::endl;
-  std::cout << "Total time in MatMul = " << (MatMulTimeInMilliSec / 1000.0)
+  if (printInfo) std::cout << "Total time in MatMul = " << (MatMulTimeInMilliSec / 1000.0)
             << " seconds." << std::endl;
-  std::cout << "Total time in BatchNorm = " << (BatchNormInMilliSec / 1000.0)
+  if (printInfo) std::cout << "Total time in BatchNorm = " << (BatchNormInMilliSec / 1000.0)
             << " seconds." << std::endl;
-  std::cout << "Total time in Truncation = "
+  if (printInfo) std::cout << "Total time in Truncation = "
             << (TruncationTimeInMilliSec / 1000.0) << " seconds." << std::endl;
-  std::cout << "Total time in Relu = " << (ReluTimeInMilliSec / 1000.0)
+  if (printInfo) std::cout << "Total time in Relu = " << (ReluTimeInMilliSec / 1000.0)
             << " seconds." << std::endl;
-  std::cout << "Total time in MaxPool = " << (MaxpoolTimeInMilliSec / 1000.0)
+  if (printInfo) std::cout << "Total time in MaxPool = " << (MaxpoolTimeInMilliSec / 1000.0)
             << " seconds." << std::endl;
-  std::cout << "Total time in AvgPool = " << (AvgpoolTimeInMilliSec / 1000.0)
+  if (printInfo) std::cout << "Total time in AvgPool = " << (AvgpoolTimeInMilliSec / 1000.0)
             << " seconds." << std::endl;
-  std::cout << "Total time in ArgMax = " << (ArgMaxTimeInMilliSec / 1000.0)
+  if (printInfo) std::cout << "Total time in ArgMax = " << (ArgMaxTimeInMilliSec / 1000.0)
             << " seconds." << std::endl;
-  std::cout << "Total time in MatAdd = " << (MatAddTimeInMilliSec / 1000.0)
+  if (printInfo) std::cout << "Total time in MatAdd = " << (MatAddTimeInMilliSec / 1000.0)
             << " seconds." << std::endl;
-  std::cout << "Total time in MatAddBroadCast = "
+  if (printInfo) std::cout << "Total time in MatAddBroadCast = "
             << (MatAddBroadCastTimeInMilliSec / 1000.0) << " seconds."
             << std::endl;
-  std::cout << "Total time in MulCir = " << (MulCirTimeInMilliSec / 1000.0)
+  if (printInfo) std::cout << "Total time in MulCir = " << (MulCirTimeInMilliSec / 1000.0)
             << " seconds." << std::endl;
-  std::cout << "Total time in ScalarMul = "
+  if (printInfo) std::cout << "Total time in ScalarMul = "
             << (ScalarMulTimeInMilliSec / 1000.0) << " seconds." << std::endl;
-  std::cout << "Total time in Sigmoid = " << (SigmoidTimeInMilliSec / 1000.0)
+  if (printInfo) std::cout << "Total time in Sigmoid = " << (SigmoidTimeInMilliSec / 1000.0)
             << " seconds." << std::endl;
-  std::cout << "Total time in Tanh = " << (TanhTimeInMilliSec / 1000.0)
+  if (printInfo) std::cout << "Total time in Tanh = " << (TanhTimeInMilliSec / 1000.0)
             << " seconds." << std::endl;
-  std::cout << "Total time in Sqrt = " << (SqrtTimeInMilliSec / 1000.0)
+  if (printInfo) std::cout << "Total time in Sqrt = " << (SqrtTimeInMilliSec / 1000.0)
             << " seconds." << std::endl;
-  std::cout << "Total time in NormaliseL2 = "
+  if (printInfo) std::cout << "Total time in NormaliseL2 = "
             << (NormaliseL2TimeInMilliSec / 1000.0) << " seconds." << std::endl;
-  std::cout << "------------------------------------------------------\n";
-  std::cout << "Conv data sent = " << ((ConvCommSent) / (1.0 * (1ULL << 20)))
+  if (printInfo) std::cout << "------------------------------------------------------\n";
+  if (printInfo) std::cout << "Conv data sent = " << ((ConvCommSent) / (1.0 * (1ULL << 20)))
             << " MiB." << std::endl;
-  std::cout << "MatMul data sent = "
+  if (printInfo) std::cout << "MatMul data sent = "
             << ((MatMulCommSent) / (1.0 * (1ULL << 20))) << " MiB."
             << std::endl;
-  std::cout << "BatchNorm data sent = "
+  if (printInfo) std::cout << "BatchNorm data sent = "
             << ((BatchNormCommSent) / (1.0 * (1ULL << 20))) << " MiB."
             << std::endl;
-  std::cout << "Truncation data sent = "
+  if (printInfo) std::cout << "Truncation data sent = "
             << ((TruncationCommSent) / (1.0 * (1ULL << 20))) << " MiB."
             << std::endl;
-  std::cout << "Relu data sent = " << ((ReluCommSent) / (1.0 * (1ULL << 20)))
+  if (printInfo) std::cout << "Relu data sent = " << ((ReluCommSent) / (1.0 * (1ULL << 20)))
             << " MiB." << std::endl;
-  std::cout << "Maxpool data sent = "
+  if (printInfo) std::cout << "Maxpool data sent = "
             << ((MaxpoolCommSent) / (1.0 * (1ULL << 20))) << " MiB."
             << std::endl;
-  std::cout << "Avgpool data sent = "
+  if (printInfo) std::cout << "Avgpool data sent = "
             << ((AvgpoolCommSent) / (1.0 * (1ULL << 20))) << " MiB."
             << std::endl;
-  std::cout << "ArgMax data sent = "
+  if (printInfo) std::cout << "ArgMax data sent = "
             << ((ArgMaxCommSent) / (1.0 * (1ULL << 20))) << " MiB."
             << std::endl;
-  std::cout << "MatAdd data sent = "
+  if (printInfo) std::cout << "MatAdd data sent = "
             << ((MatAddCommSent) / (1.0 * (1ULL << 20))) << " MiB."
             << std::endl;
-  std::cout << "MatAddBroadCast data sent = "
+  if (printInfo) std::cout << "MatAddBroadCast data sent = "
             << ((MatAddBroadCastCommSent) / (1.0 * (1ULL << 20))) << " MiB."
             << std::endl;
-  std::cout << "MulCir data sent = "
+  if (printInfo) std::cout << "MulCir data sent = "
             << ((MulCirCommSent) / (1.0 * (1ULL << 20))) << " MiB."
             << std::endl;
-  std::cout << "Sigmoid data sent = "
+  if (printInfo) std::cout << "Sigmoid data sent = "
             << ((SigmoidCommSent) / (1.0 * (1ULL << 20))) << " MiB."
             << std::endl;
-  std::cout << "Tanh data sent = " << ((TanhCommSent) / (1.0 * (1ULL << 20)))
+  if (printInfo) std::cout << "Tanh data sent = " << ((TanhCommSent) / (1.0 * (1ULL << 20)))
             << " MiB." << std::endl;
-  std::cout << "Sqrt data sent = " << ((SqrtCommSent) / (1.0 * (1ULL << 20)))
+  if (printInfo) std::cout << "Sqrt data sent = " << ((SqrtCommSent) / (1.0 * (1ULL << 20)))
             << " MiB." << std::endl;
-  std::cout << "NormaliseL2 data sent = "
+  if (printInfo) std::cout << "NormaliseL2 data sent = "
             << ((NormaliseL2CommSent) / (1.0 * (1ULL << 20))) << " MiB."
             << std::endl;
-  std::cout << "------------------------------------------------------\n";
+  if (printInfo) std::cout << "------------------------------------------------------\n";
   if (party == SERVER) {
     uint64_t ConvCommSentClient = 0;
     uint64_t MatMulCommSentClient = 0;
@@ -1709,14 +2139,14 @@ void EndComputation() {
     io->recv_data(&SqrtCommSentClient, sizeof(uint64_t));
     io->recv_data(&NormaliseL2CommSentClient, sizeof(uint64_t));
 
-    std::cout << "Conv data (sent+received) = "
+    if (printInfo) std::cout << "Conv data (sent+received) = "
               << ((ConvCommSent + ConvCommSentClient) / (1.0 * (1ULL << 20)))
               << " MiB." << std::endl;
-    std::cout << "MatMul data (sent+received) = "
+    if (printInfo) std::cout << "MatMul data (sent+received) = "
               << ((MatMulCommSent + MatMulCommSentClient) /
                   (1.0 * (1ULL << 20)))
               << " MiB." << std::endl;
-    std::cout << "BatchNorm data (sent+received) = "
+    if (printInfo) std::cout << "BatchNorm data (sent+received) = "
               << ((BatchNormCommSent + BatchNormCommSentClient) /
                   (1.0 * (1ULL << 20)))
               << " MiB." << std::endl;
@@ -1727,45 +2157,45 @@ void EndComputation() {
     std::cout << "Relu data (sent+received) = "
               << ((ReluCommSent + ReluCommSentClient) / (1.0 * (1ULL << 20)))
               << " MiB." << std::endl;
-    std::cout << "Maxpool data (sent+received) = "
+    if (printInfo) std::cout << "Maxpool data (sent+received) = "
               << ((MaxpoolCommSent + MaxpoolCommSentClient) /
                   (1.0 * (1ULL << 20)))
               << " MiB." << std::endl;
-    std::cout << "Avgpool data (sent+received) = "
+    if (printInfo) std::cout << "Avgpool data (sent+received) = "
               << ((AvgpoolCommSent + AvgpoolCommSentClient) /
                   (1.0 * (1ULL << 20)))
               << " MiB." << std::endl;
-    std::cout << "ArgMax data (sent+received) = "
+    if (printInfo) std::cout << "ArgMax data (sent+received) = "
               << ((ArgMaxCommSent + ArgMaxCommSentClient) /
                   (1.0 * (1ULL << 20)))
               << " MiB." << std::endl;
-    std::cout << "MatAdd data (sent+received) = "
+    if (printInfo) std::cout << "MatAdd data (sent+received) = "
               << ((MatAddCommSent + MatAddCommSentClient) /
                   (1.0 * (1ULL << 20)))
               << " MiB." << std::endl;
-    std::cout << "MatAddBroadCast data (sent+received) = "
+    if (printInfo) std::cout << "MatAddBroadCast data (sent+received) = "
               << ((MatAddBroadCastCommSent + MatAddBroadCastCommSentClient) /
                   (1.0 * (1ULL << 20)))
               << " MiB." << std::endl;
-    std::cout << "MulCir data (sent+received) = "
+    if (printInfo) std::cout << "MulCir data (sent+received) = "
               << ((MulCirCommSent + MulCirCommSentClient) /
                   (1.0 * (1ULL << 20)))
               << " MiB." << std::endl;
-    std::cout << "ScalarMul data (sent+received) = "
+    if (printInfo) std::cout << "ScalarMul data (sent+received) = "
               << ((ScalarMulCommSent + ScalarMulCommSentClient) /
                   (1.0 * (1ULL << 20)))
               << " MiB." << std::endl;
-    std::cout << "Sigmoid data (sent+received) = "
+    if (printInfo) std::cout << "Sigmoid data (sent+received) = "
               << ((SigmoidCommSent + SigmoidCommSentClient) /
                   (1.0 * (1ULL << 20)))
               << " MiB." << std::endl;
-    std::cout << "Tanh data (sent+received) = "
+    if (printInfo) std::cout << "Tanh data (sent+received) = "
               << ((TanhCommSent + TanhCommSentClient) / (1.0 * (1ULL << 20)))
               << " MiB." << std::endl;
-    std::cout << "Sqrt data (sent+received) = "
+    if (printInfo) std::cout << "Sqrt data (sent+received) = "
               << ((SqrtCommSent + SqrtCommSentClient) / (1.0 * (1ULL << 20)))
               << " MiB." << std::endl;
-    std::cout << "NormaliseL2 data (sent+received) = "
+    if (printInfo) std::cout << "NormaliseL2 data (sent+received) = "
               << ((NormaliseL2CommSent + NormaliseL2CommSentClient) /
                   (1.0 * (1ULL << 20)))
               << " MiB." << std::endl;

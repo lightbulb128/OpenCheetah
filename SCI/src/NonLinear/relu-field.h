@@ -203,6 +203,60 @@ public:
     delete[] ot_messages;
   }
 
+  void drelumul(type *result, type *share, int num_relu,
+            uint8_t *drelu_res, bool skip_ot = false) {
+
+    // Now perform x.msb(x)
+    // 2 OTs required with reversed roles
+    uint64_t **ot_messages = new uint64_t *[num_relu];
+    for (int i = 0; i < num_relu; i++) {
+      ot_messages[i] = new uint64_t[2];
+    }
+    uint64_t *additive_masks = new uint64_t[num_relu];
+    uint64_t *received_shares = new uint64_t[num_relu];
+    this->triple_gen->prg->template random_mod_p<type>((type *)additive_masks,
+                                                       num_relu, this->p);
+    for (int i = 0; i < num_relu; i++) {
+      additive_masks[i] %= this->p;
+    }
+
+    switch (this->party) {
+    case sci::ALICE: {
+      for (int i = 0; i < num_relu; i++) {
+        set_relu_end_ot_messages(ot_messages[i], share + i, drelu_res + i,
+                                 ((type *)additive_masks) + i);
+      }
+      otpack->iknp_straight->send(ot_messages, num_relu, this->l);
+      otpack->iknp_reversed->recv(received_shares, drelu_res, num_relu,
+                                  this->l);
+      break;
+    }
+    case sci::BOB: {
+      for (int i = 0; i < num_relu; i++) {
+        set_relu_end_ot_messages(ot_messages[i], share + i, drelu_res + i,
+                                 ((type *)additive_masks) + i);
+      }
+      otpack->iknp_straight->recv(received_shares, drelu_res, num_relu,
+                                  this->l);
+      otpack->iknp_reversed->send(ot_messages, num_relu, this->l);
+      break;
+    }
+    }
+    io->flush();
+
+    for (int i = 0; i < num_relu; i++) {
+      result[i] = ((type *)additive_masks)[i] +
+                  ((type *)received_shares)[(8 / sizeof(type)) * i];
+      result[i] %= this->p;
+    }
+    delete[] additive_masks;
+    delete[] received_shares;
+    for (int i = 0; i < num_relu; i++) {
+      delete[] ot_messages[i];
+    }
+    delete[] ot_messages;
+  }
+
   void set_relu_end_ot_messages(uint64_t *ot_messages, type *value_share,
                                 uint8_t *xor_share, type *additive_mask) {
     type temp0, temp1;
