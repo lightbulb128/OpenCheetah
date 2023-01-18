@@ -67,3 +67,18 @@ Also, you can use our throttle script to mimic a remote network condition within
 * To use the throttle script under [scripts/throttle.sh](scripts/throttle.sh) to limit the network speed and ping latency (require `sudo`)
 * For example, run `sudo scripts/throttle.sh wan` on a Linux OS which will limit the local-loop interface to about 400Mbps bandwidth and 40ms ping latency.
   You can check the ping latency by just `ping 127.0.0.1`. The bandwidth can be check using extra `iperf` command.
+
+
+
+
+# pLimo edition
+
+Added several utilities for pLimo. Also added encapsulation for python.
+
+Usage (after OpenCheetah itself has been compiled)
+```
+cd build
+cmake ..
+make
+```
+You will see two modules `sci_provider_alice, sci_provider_bob` in `build/lib` which could be imported into python directly.
