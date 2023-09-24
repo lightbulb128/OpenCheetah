@@ -17,7 +17,7 @@ find_package(HEXL REQUIRED PATHS ${CMAKE_BINARY_DIR}/lib/cmake/hexl-1.2.2)
 find_package(Threads REQUIRED)
 find_package(OpenSSL REQUIRED)
 find_package(Eigen3 3.3.3 REQUIRED)
-find_package(SEAL REQUIRED PATHS ${CMAKE_BINARY_DIR}/lib/cmake/SEAL-3.7)
+find_package(SEAL 3.7 REQUIRED PATHS ${CMAKE_BINARY_DIR}/lib/cmake/SEAL-3.7)
 find_package(emp-tool REQUIRED)
 find_package(emp-ot REQUIRED)
 include_directories(${EIGEN3_INCLUDE_DIR}
