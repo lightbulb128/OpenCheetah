@@ -72,6 +72,7 @@
         "variant": "cpp",
         "pointers": "cpp",
         "span": "cpp",
-        "tensor": "cpp"
+        "tensor": "cpp",
+        "fft": "cpp"
     }
 }
